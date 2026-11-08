@@ -9,7 +9,6 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Supabase REST Configuration (Works anywhere on standard HTTPS, no IPv6 issues)
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "https://ovhqorkmwipxpzbxzywh.supabase.co").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "sb_publishable_Odvhc7PLvccbY9pleKOQmg_xM6Wo-mo").strip()
 
@@ -19,8 +18,21 @@ class Database:
         self.base_url = base_url
         self.api_key = api_key
         self.rest_url = f"{self.base_url}/rest/v1"
-        self._local = threading.local()
-        logger.info(f"Initialized Cloud Supabase REST client at {self.rest_url}")
+        self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler())
+        
+        # High speed in-memory cache for ultra-fast bot response
+        self._cache_lock = threading.Lock()
+        self._stock_cache = {}          # {service: {country: [numbers]}}
+        self._owner_map = {}            # {number: chat_id}
+        self._owner_info = {}           # {number: (chat_id, name)}
+        self._users_cache = set()       # {chat_id}
+        self._processed_hashes = set()  # {msg_hash}
+        self._services_cache = None     # [services]
+        self._settings_cache = {}       # {key: val}
+        self._panels_cache = None       # [panels]
+
+        # Initial fast preload from Cloud Supabase
+        self.reload_cache()
 
     def _headers(self, prefer=None) -> dict:
         h = {
@@ -45,7 +57,7 @@ class Database:
 
         req = urllib.request.Request(url, data=data_bytes, headers=self._headers(prefer), method=method)
         try:
-            with urllib.request.urlopen(req, timeout=15) as res:
+            with self._opener.open(req, timeout=10) as res:
                 body = res.read().decode("utf-8")
                 if not body:
                     return None
@@ -57,109 +69,192 @@ class Database:
             logger.error(f"Supabase REST error [{method} {endpoint}]: {e}")
             return None
 
-    # ── Processed messages ──────────────────────────────────────────────────
+    def reload_cache(self):
+        """Preload active state from Supabase into memory for ultra-fast instant lookups."""
+        try:
+            # 1. Available Numbers (Stock)
+            res = self._req("numbers", params={"status": "eq.available", "select": "service,country,number"})
+            new_stock = {}
+            if isinstance(res, list):
+                for r in res:
+                    s = (r.get("service") or "").upper()
+                    c = (r.get("country") or "").upper()
+                    n = str(r.get("number")).strip()
+                    if s and c and n:
+                        new_stock.setdefault(s, {}).setdefault(c, []).append(n)
+
+            # 2. Number Ownership Map
+            res_assigned = self._req("numbers", params={"owner_chat_id": "not.is.null", "select": "number,owner_chat_id,owner_name"})
+            new_owner_map = {}
+            new_owner_info = {}
+            if isinstance(res_assigned, list):
+                for r in res_assigned:
+                    cid = r.get("owner_chat_id")
+                    name = r.get("owner_name")
+                    n_str = str(r.get("number")).strip()
+                    clean = n_str.lstrip("+")
+                    new_owner_map[n_str] = cid
+                    new_owner_map[clean] = cid
+                    new_owner_map[f"+{clean}"] = cid
+                    info = (cid, name)
+                    new_owner_info[n_str] = info
+                    new_owner_info[clean] = info
+                    new_owner_info[f"+{clean}"] = info
+
+            # 3. Users
+            res_users = self._req("users", params={"select": "chat_id"})
+            new_users = set()
+            if isinstance(res_users, list):
+                for u in res_users:
+                    if u.get("chat_id"):
+                        new_users.add(u["chat_id"])
+
+            with self._cache_lock:
+                self._stock_cache = new_stock
+                self._owner_map = new_owner_map
+                self._owner_info = new_owner_info
+                self._users_cache = new_users
+
+            logger.info("Ultra-fast cache reloaded successfully from Supabase!")
+        except Exception as e:
+            logger.error(f"Error during cache preload: {e}")
+
+    # ── Processed messages (Monitor) ────────────────────────────────────────
 
     async def is_msg_processed(self, msg_hash: str) -> bool:
+        if msg_hash in self._processed_hashes:
+            return True
         res = self._req("processed_messages", params={"msg_hash": f"eq.{msg_hash}", "select": "msg_hash"})
-        return bool(res)
+        if res:
+            self._processed_hashes.add(msg_hash)
+            return True
+        return False
 
     async def mark_msg_processed(self, msg_hash: str):
-        self._req(
-            "processed_messages",
-            method="POST",
-            json_data={"msg_hash": msg_hash},
-            prefer="resolution=ignore-duplicates"
-        )
+        self._processed_hashes.add(msg_hash)
+        self._req("processed_messages", method="POST", json_data={"msg_hash": msg_hash}, prefer="resolution=ignore-duplicates")
 
     # ── Users ───────────────────────────────────────────────────────────────
 
     def add_user(self, chat_id: int):
-        self._req("users", method="POST", json_data={"chat_id": chat_id}, prefer="resolution=ignore-duplicates")
+        if chat_id not in self._users_cache:
+            self._users_cache.add(chat_id)
+            self._req("users", method="POST", json_data={"chat_id": chat_id}, prefer="resolution=ignore-duplicates")
 
     def get_users(self) -> list:
-        res = self._req("users", params={"select": "chat_id"})
-        if isinstance(res, list):
-            return [r["chat_id"] for r in res]
-        return []
+        return list(self._users_cache)
 
-    # ── Number pool / stock ─────────────────────────────────────────────────
+    # ── Number Pool / Stock (Ultra Fast & Realtime Sync) ─────────────────────
 
     def add_numbers(self, service: str, country: str, numbers) -> int:
-        batch = []
+        service = service.upper()
+        country = country.upper()
+        clean_nums = []
         for n in numbers:
-            n = str(n).strip()
-            if not n:
-                continue
+            s = str(n).strip()
+            if s and s not in clean_nums:
+                clean_nums.append(s)
+
+        if not clean_nums:
+            return 0
+
+        # Update in-memory stock cache instantly
+        with self._cache_lock:
+            cur_pool = self._stock_cache.setdefault(service, {}).setdefault(country, [])
+            for n in clean_nums:
+                if n not in cur_pool:
+                    cur_pool.append(n)
+
+        # Batch write to Supabase (500 per batch)
+        batch = []
+        for n in clean_nums:
             batch.append({"number": n, "service": service, "country": country, "status": "available"})
             if len(batch) >= 500:
                 self._req("numbers", method="POST", json_data=batch, prefer="resolution=ignore-duplicates")
                 batch = []
         if batch:
             self._req("numbers", method="POST", json_data=batch, prefer="resolution=ignore-duplicates")
-        return len(numbers)
+
+        return len(clean_nums)
 
     def get_stock(self) -> dict:
-        # Fetch available numbers
-        res = self._req("numbers", params={"status": "eq.available", "select": "service,country,number"})
-        stock = {}
-        if isinstance(res, list):
-            for r in res:
-                s, c, n = r.get("service"), r.get("country"), r.get("number")
-                stock.setdefault(s, {}).setdefault(c, []).append(n)
-        return stock
+        """Return stock instantly from memory without remote HTTP latency."""
+        with self._cache_lock:
+            # Return deep copy so callers can inspect safely
+            return {s: {c: list(nums) for c, nums in cty.items()} for s, cty in self._stock_cache.items()}
 
     def get_number_owner_map(self) -> dict:
-        res = self._req("numbers", params={"owner_chat_id": "not.is.null", "status": "in.(assigned,replaced)", "select": "number,owner_chat_id"})
-        mapping = {}
-        if isinstance(res, list):
-            for r in res:
-                n, c = r.get("number"), r.get("owner_chat_id")
-                s = str(n).strip()
-                clean = s.lstrip("+")
-                mapping[s] = c
-                mapping[clean] = c
-                mapping[f"+{clean}"] = c
-        return mapping
+        """Instant memory lookup for SMS monitors."""
+        with self._cache_lock:
+            return dict(self._owner_map)
 
     def get_number_owner_info(self, number: str):
-        s = str(number).strip()
-        clean = s.lstrip("+")
-        # Match any of number, clean, +clean
-        cond = f"number.in.({s},{clean},+{clean}),owner_chat_id.not.is.null"
-        res = self._req("numbers", params={"or": f"(number.eq.{s},number.eq.{clean},number.eq.+{clean})", "owner_chat_id": "not.is.null", "select": "owner_chat_id,owner_name", "limit": "1"})
-        if isinstance(res, list) and res:
-            return res[0].get("owner_chat_id"), res[0].get("owner_name")
-        return None, None
+        with self._cache_lock:
+            s = str(number).strip()
+            clean = s.lstrip("+")
+            return self._owner_info.get(s) or self._owner_info.get(clean) or self._owner_info.get(f"+{clean}") or (None, None)
 
     def release_user_numbers(self, chat_id: int, service: str, country: str = None) -> int:
+        service = service.upper()
+        country = country.upper() if country else None
         params = {"owner_chat_id": f"eq.{chat_id}", "service": f"eq.{service}", "status": "eq.assigned"}
         if country:
             params["country"] = f"eq.{country}"
         res = self._req("numbers", method="PATCH", params=params, json_data={"status": "replaced"}, prefer="return=representation")
         return len(res) if isinstance(res, list) else 0
 
-    def reserve_numbers(self, service, country=None, prefix=None, count=5,
-                        shuffle=False, chat_id=None, owner_name=None) -> list:
-        params = {"service": f"eq.{service}", "status": "eq.available", "select": "number"}
-        if country:
-            params["country"] = f"eq.{country}"
-        if prefix:
-            clean_pref = str(prefix).strip().lstrip("+")
-            params["or"] = f"(number.like.{prefix}*,number.like.+{clean_pref}*,number.like.{clean_pref}*)"
+    def reserve_numbers(self, service: str, country: str = None, prefix: str = None, count: int = 5,
+                        shuffle: bool = False, chat_id: int = None, owner_name: str = None) -> list:
+        service = service.upper()
+        country = country.upper() if country else None
 
-        res = self._req("numbers", params=params)
-        pool = [r["number"] for r in res] if isinstance(res, list) else []
-        if not pool:
-            return []
+        with self._cache_lock:
+            country_dict = self._stock_cache.get(service, {})
+            if country:
+                pool = list(country_dict.get(country, []))
+            else:
+                pool = [n for nums in country_dict.values() for n in nums]
 
-        if shuffle:
-            random.shuffle(pool)
-        take = pool[:count]
-        if not take:
-            return []
+            if prefix:
+                clean_pref = str(prefix).strip().lstrip("+")
+                pool = [
+                    n for n in pool
+                    if str(n).strip().startswith(str(prefix).strip())
+                    or str(n).strip().lstrip("+").startswith(clean_pref)
+                ]
 
-        num_list_str = f"({','.join(take)})"
+            if not pool:
+                return []
+
+            if shuffle:
+                random.shuffle(pool)
+
+            take = pool[:count]
+            if not take:
+                return []
+
+            take_set = set(take)
+
+            # Instantly remove reserved from in-memory cache
+            for c_key in list(country_dict.keys()):
+                country_dict[c_key] = [n for n in country_dict[c_key] if n not in take_set]
+
+            # Instantly register ownership in cache
+            if chat_id:
+                for n in take:
+                    n_str = str(n).strip()
+                    clean = n_str.lstrip("+")
+                    self._owner_map[n_str] = chat_id
+                    self._owner_map[clean] = chat_id
+                    self._owner_map[f"+{clean}"] = chat_id
+                    info = (chat_id, owner_name)
+                    self._owner_info[n_str] = info
+                    self._owner_info[clean] = info
+                    self._owner_info[f"+{clean}"] = info
+
+        # Sync update in Supabase background
         now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        num_list_str = f"({','.join(take)})"
         self._req(
             "numbers",
             method="PATCH",
@@ -174,11 +269,16 @@ class Database:
         return take
 
     def remove_numbers(self, service: str, country: str) -> int:
+        service = service.upper()
+        country = country.upper()
+        with self._cache_lock:
+            if service in self._stock_cache and country in self._stock_cache[service]:
+                del self._stock_cache[service][country]
+
         res = self._req("numbers", method="DELETE", params={"service": f"eq.{service}", "country": f"eq.{country}"}, prefer="return=representation")
         return len(res) if isinstance(res, list) else 0
 
     def get_stock_summary(self) -> list:
-        # Group summary from database
         res = self._req("numbers", params={"select": "service,country,status"})
         summary = {}
         if isinstance(res, list):
@@ -198,6 +298,10 @@ class Database:
         ]
 
     def reset_db(self):
+        with self._cache_lock:
+            self._stock_cache.clear()
+            self._owner_map.clear()
+            self._owner_info.clear()
         self._req("numbers", method="DELETE", params={"id": "gt.0"})
         self._req("otps", method="DELETE", params={"id": "gt.0"})
         self._req("processed_messages", method="DELETE", params={"created_at": "not.is.null"})
@@ -213,7 +317,6 @@ class Database:
         )
 
     def otp_summary(self, period="all") -> list:
-        # Fetch OTPs and cross with numbers
         otps_res = self._req("otps", params={"select": "number,created_at"})
         if not isinstance(otps_res, list) or not otps_res:
             return []
@@ -289,12 +392,17 @@ class Database:
         return []
 
     def get_setting(self, key: str, default: str = None) -> str:
+        if key in self._settings_cache:
+            return self._settings_cache[key]
         res = self._req("settings", params={"key": f"eq.{key}", "select": "value"})
         if isinstance(res, list) and res:
-            return res[0].get("value")
+            val = res[0].get("value")
+            self._settings_cache[key] = val
+            return val
         return default
 
     def set_setting(self, key: str, value: str):
+        self._settings_cache[key] = str(value)
         self._req("settings", method="POST", json_data={"key": key, "value": str(value)}, prefer="resolution=merge-duplicates")
 
     # ── Dynamic Services ────────────────────────────────────────────────────
@@ -307,16 +415,21 @@ class Database:
     ]
 
     def get_services(self) -> list:
+        if self._services_cache is not None:
+            return self._services_cache
         raw = self.get_setting("services")
         if raw:
             try:
-                return json.loads(raw)
+                self._services_cache = json.loads(raw)
+                return self._services_cache
             except Exception:
                 pass
+        self._services_cache = list(self._DEFAULT_SERVICES)
         self.save_services(self._DEFAULT_SERVICES)
-        return list(self._DEFAULT_SERVICES)
+        return self._services_cache
 
     def save_services(self, services: list):
+        self._services_cache = list(services)
         self.set_setting("services", json.dumps(services, ensure_ascii=False))
 
     # ── Dynamic Panels Management ───────────────────────────────────────────
@@ -324,7 +437,7 @@ class Database:
     def get_all_panels(self) -> list:
         res = self._req("panels", params={"select": "id,name,base_url,api_key,is_active,created_at", "order": "id.asc"})
         if isinstance(res, list):
-            return [
+            self._panels_cache = [
                 {
                     "id": r.get("id"),
                     "name": r.get("name"),
@@ -335,10 +448,12 @@ class Database:
                 }
                 for r in res
             ]
-        return []
+            return self._panels_cache
+        return self._panels_cache or []
 
     def add_panel(self, name: str, base_url: str, api_key: str) -> bool:
         res = self._req("panels", method="POST", json_data={"name": name.strip(), "base_url": base_url.strip(), "api_key": api_key.strip(), "is_active": 1})
+        self.get_all_panels()
         return res is not None
 
     def toggle_panel_status(self, panel_id: int) -> bool | None:
@@ -347,11 +462,13 @@ class Database:
             current = bool(res[0].get("is_active"))
             new_status = 0 if current else 1
             self._req("panels", method="PATCH", params={"id": f"eq.{panel_id}"}, json_data={"is_active": new_status})
+            self.get_all_panels()
             return bool(new_status)
         return None
 
     def delete_panel(self, panel_id: int) -> bool:
         res = self._req("panels", method="DELETE", params={"id": f"eq.{panel_id}"}, prefer="return=representation")
+        self.get_all_panels()
         return bool(res)
 
 
