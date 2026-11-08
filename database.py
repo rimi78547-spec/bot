@@ -372,6 +372,58 @@ class Database:
                     res.append(n)
         return res
 
+    def get_user_otp_stats_and_history(self, chat_id: int, limit: int = 20):
+        """Calculate Bangladesh Time 6AM-6AM stats and return (today_count, total_count, history)."""
+        from datetime import datetime, timezone, timedelta
+        
+        nums_res = self._req("numbers", params={"owner_chat_id": f"eq.{chat_id}", "select": "number"})
+        if not isinstance(nums_res, list) or not nums_res:
+            return 0, 0, []
+
+        clean_nums = set(str(r["number"]).lstrip("+") for r in nums_res)
+        
+        # All OTPs for matching
+        otps_res = self._req("otps", params={"select": "number,service,otp,created_at", "order": "created_at.desc"})
+        if not isinstance(otps_res, list) or not otps_res:
+            return 0, 0, []
+
+        # BD Time (UTC+6)
+        bd_tz = timezone(timedelta(hours=6))
+        now_bd = datetime.now(bd_tz)
+        
+        # BD 6AM window: if now is before 6AM, window started yesterday at 6AM, else today at 6AM
+        if now_bd.hour < 6:
+            start_bd = now_bd.replace(hour=6, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        else:
+            start_bd = now_bd.replace(hour=6, minute=0, second=0, microsecond=0)
+        
+        # Start in UTC
+        start_utc = start_bd.astimezone(timezone.utc)
+
+        today_count = 0
+        total_count = 0
+        history = []
+
+        for o in otps_res:
+            num_clean = str(o.get("number", "")).lstrip("+")
+            if num_clean in clean_nums:
+                total_count += 1
+                created_str = str(o.get("created_at", ""))
+                # Parse created_at
+                try:
+                    dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt >= start_utc:
+                        today_count += 1
+                except Exception:
+                    pass
+
+                if len(history) < limit:
+                    history.append((o.get("number"), o.get("service"), o.get("otp"), o.get("created_at")))
+
+        return today_count, total_count, history
+
     def get_user_otp_history(self, chat_id: int, limit: int = 20) -> list:
         nums_res = self._req("numbers", params={"owner_chat_id": f"eq.{chat_id}", "select": "number"})
         if not isinstance(nums_res, list) or not nums_res:

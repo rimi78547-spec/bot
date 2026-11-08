@@ -553,24 +553,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif "OTP HISTORY" in text:
         chat_id = update.effective_chat.id
-        history = db.get_user_otp_history(chat_id, limit=20)
+        today_count, total_count, history = db.get_user_otp_stats_and_history(chat_id, limit=20)
+        
+        header = (
+            "📜 <b>YOUR OTP HISTORY & STATS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 <b>Today (BD Time 6AM-6AM):</b> {today_count}\n"
+            f"📈 <b>Total Received:</b> {total_count}"
+        )
+
         if not history:
             await update.message.reply_text(
-                "📭 <b>No OTP history yet.</b>\n\n"
-                "OTPs will appear here once your numbers receive them.",
+                f"{header}\n\n"
+                "📭 <i>No OTPs received yet. OTPs will appear here once your numbers receive them.</i>",
                 parse_mode="HTML"
             )
         else:
-            lines = ["🪵 <b>Your OTP History (Last 20)</b>\n──────────────────────"]
+            lines = [header, "──────────────────────"]
             for number, service, otp, created_at in history:
                 flag = ui.get_country_flag(phone_number=number)
-                ts = str(created_at)[:16]  # YYYY-MM-DD HH:MM
+                ts = str(created_at)[:16].replace("T", " ")
                 lines.append(
                     f"📞 {flag} <code>{number}</code>\n"
                     f"📱 {service}  🔑 <b>{otp}</b>  🕐 {ts}"
                 )
             await update.message.reply_text(
-                "\n──────────\n".join(lines),
+                "\n".join(lines[:2]) + "\n\n" + "\n──────────\n".join(lines[2:]),
                 parse_mode="HTML"
             )
         return

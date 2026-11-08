@@ -318,3 +318,4 @@ class GenericPanelMonitor:
                 logger.error(f"Error in Panel [{self.name}] loop: {e}", exc_info=True)
                 self._error_count += 1
             await asyncio.sleep(self.poll_interval)
+
