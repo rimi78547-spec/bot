@@ -16,6 +16,7 @@ import ui
 from database import db
 from lamix_monitor import LamixMonitor
 from sevenonetel_monitor import SevenOneTelMonitor
+from generic_panel_monitor import GenericPanelMonitor
 from telegram_checker import check_numbers as checker_check_numbers
 
 # Load env variables
@@ -232,6 +233,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if "Manage Panels" in text:
+            panels = db.get_all_panels()
+            await update.message.reply_text(
+                "🌐 <b>Manage Panels</b>\n\n"
+                "Here you can add new SMS panels or Start/Stop existing panels.\n"
+                "Active panels are shown with 🟢, Stopped panels with 🔴.",
+                parse_mode="HTML",
+                reply_markup=ui.get_admin_panels_keyboard(panels)
+            )
+            return
+
         if "Upload Numbers" in text:
             services = db.get_services()
             await update.message.reply_text(
@@ -299,6 +311,91 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=ui.get_admin_reset_confirm_keyboard()
             )
+            return
+
+        # ── Step 1: Panel Name Input ──
+        if context.user_data.get('awaiting_panel_name'):
+            if text == "/cancel":
+                context.user_data['awaiting_panel_name'] = False
+                await update.message.reply_text("❌ Cancelled adding panel.")
+                return
+            context.user_data['awaiting_panel_name'] = False
+            panel_name = text.strip()
+            context.user_data['temp_panel_name'] = panel_name
+            context.user_data['awaiting_panel_url'] = True
+            await update.message.reply_text(
+                f"✅ Panel Name: <b>{panel_name}</b>\n\n"
+                f"🔗 Now send the Panel API URL / Link\n"
+                f"(e.g. <code>https://panel.example.com/api/v1/messages</code> or <code>https://api.example.com/cdrs</code>)\n\n"
+                f"Or send /cancel to abort:",
+                parse_mode="HTML"
+            )
+            return
+
+        # ── Step 2: Panel URL Input ──
+        if context.user_data.get('awaiting_panel_url'):
+            if text == "/cancel":
+                context.user_data['awaiting_panel_url'] = False
+                context.user_data.pop('temp_panel_name', None)
+                await update.message.reply_text("❌ Cancelled adding panel.")
+                return
+            context.user_data['awaiting_panel_url'] = False
+            panel_url = text.strip()
+            context.user_data['temp_panel_url'] = panel_url
+            context.user_data['awaiting_panel_key'] = True
+            await update.message.reply_text(
+                f"✅ Panel Link: <code>{panel_url}</code>\n\n"
+                f"🔑 Now send the API Key / Token for this panel:\n\n"
+                f"Or send /cancel to abort:",
+                parse_mode="HTML"
+            )
+            return
+
+        # ── Step 3: Panel API Key Input ──
+        if context.user_data.get('awaiting_panel_key'):
+            if text == "/cancel":
+                context.user_data['awaiting_panel_key'] = False
+                context.user_data.pop('temp_panel_name', None)
+                context.user_data.pop('temp_panel_url', None)
+                await update.message.reply_text("❌ Cancelled adding panel.")
+                return
+            context.user_data['awaiting_panel_key'] = False
+            panel_key = text.strip()
+            panel_name = context.user_data.pop('temp_panel_name', 'Custom Panel')
+            panel_url = context.user_data.pop('temp_panel_url', '')
+
+            # Save in database
+            saved = db.add_panel(panel_name, panel_url, panel_key)
+            if saved:
+                # Start monitoring task dynamically
+                all_panels = db.get_all_panels()
+                added_p = next((p for p in all_panels if p['name'] == panel_name), None)
+                if added_p:
+                    custom_monitors = context.bot_data.setdefault('custom_monitors', {})
+                    mon = GenericPanelMonitor(
+                        context.application,
+                        added_p['id'],
+                        added_p['name'],
+                        added_p['base_url'],
+                        added_p['api_key']
+                    )
+                    custom_monitors[added_p['id']] = mon
+                    await mon.start()
+
+                await update.message.reply_text(
+                    f"🎉 <b>Panel Added & Started Successfully!</b>\n\n"
+                    f"📛 Name: <b>{panel_name}</b>\n"
+                    f"🔗 Link: <code>{panel_url}</code>\n"
+                    f"🔑 Key: <code>{panel_key[:6]}...{panel_key[-4:] if len(panel_key) > 10 else ''}</code>\n"
+                    f"🟢 Status: <b>Active (Running)</b>",
+                    parse_mode="HTML",
+                    reply_markup=ui.get_admin_reply_keyboard(checker_enabled=checker_enabled)
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ Failed to add panel. A panel with name <b>{panel_name}</b> might already exist.",
+                    parse_mode="HTML"
+                )
             return
 
         if context.user_data.get('awaiting_admin_broadcast'):
@@ -864,6 +961,74 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ui.get_admin_report_keyboard()
         )
 
+    # ── Custom Panels Callback Handlers ──
+    elif data == "panel_add_start":
+        if not is_admin(user_id):
+            return
+        context.user_data['awaiting_panel_name'] = True
+        await query.message.reply_text(
+            "➕ <b>Add New Panel (Step 1/3)</b>\n\n"
+            "Please send the <b>Name</b> for this panel (e.g. <code>Panel 7</code> or <code>FastSMS</code>):\n\n"
+            "Or send /cancel to abort.",
+            parse_mode="HTML"
+        )
+
+    elif data.startswith("panel_toggle_"):
+        if not is_admin(user_id):
+            return
+        p_id = int(data.replace("panel_toggle_", ""))
+        new_status = db.toggle_panel_status(p_id)
+        custom_monitors = context.bot_data.setdefault('custom_monitors', {})
+
+        if new_status is True:
+            # Re-start or start monitor
+            all_panels = db.get_all_panels()
+            p_data = next((p for p in all_panels if p['id'] == p_id), None)
+            if p_data:
+                if p_id in custom_monitors:
+                    await custom_monitors[p_id].stop()
+                mon = GenericPanelMonitor(
+                    context.application,
+                    p_data['id'],
+                    p_data['name'],
+                    p_data['base_url'],
+                    p_data['api_key']
+                )
+                custom_monitors[p_id] = mon
+                await mon.start()
+        elif new_status is False:
+            # Stop monitor
+            if p_id in custom_monitors:
+                await custom_monitors[p_id].stop()
+
+        panels = db.get_all_panels()
+        await query.edit_message_text(
+            "🌐 <b>Manage Panels</b>\n\n"
+            "Panel status updated.\n"
+            "Active panels are shown with 🟢, Stopped panels with 🔴.",
+            parse_mode="HTML",
+            reply_markup=ui.get_admin_panels_keyboard(panels)
+        )
+
+    elif data.startswith("panel_delete_"):
+        if not is_admin(user_id):
+            return
+        p_id = int(data.replace("panel_delete_", ""))
+        custom_monitors = context.bot_data.setdefault('custom_monitors', {})
+        if p_id in custom_monitors:
+            await custom_monitors[p_id].stop()
+            custom_monitors.pop(p_id, None)
+        db.delete_panel(p_id)
+
+        panels = db.get_all_panels()
+        await query.edit_message_text(
+            "🌐 <b>Manage Panels</b>\n\n"
+            "🗑 Panel deleted.\n"
+            "Active panels are shown with 🟢, Stopped panels with 🔴.",
+            parse_mode="HTML",
+            reply_markup=ui.get_admin_panels_keyboard(panels)
+        )
+
     elif data == "report_summary":
         if not is_admin(user_id):
             return
@@ -972,6 +1137,23 @@ def main():
     async def post_init(app):
         await lamix_monitor.start()
         await sevenonetel_monitor.start()
+
+        # Start any active dynamic panels from database
+        custom_monitors = app.bot_data.setdefault('custom_monitors', {})
+        for p in db.get_all_panels():
+            if p.get('is_active'):
+                try:
+                    mon = GenericPanelMonitor(
+                        app,
+                        p['id'],
+                        p['name'],
+                        p['base_url'],
+                        p['api_key']
+                    )
+                    custom_monitors[p['id']] = mon
+                    await mon.start()
+                except Exception as e:
+                    logger.error(f"Failed to start dynamic panel monitor [{p.get('name')}]: {e}")
 
     application.post_init = post_init
 

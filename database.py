@@ -87,6 +87,18 @@ class Database:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS panels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
 
     # ── processed messages (monitor) ──────────────────────────────────────────
@@ -381,6 +393,57 @@ class Database:
         """Persist services list (list of {label, name}) to settings."""
         import json
         self.set_setting("services", json.dumps(services, ensure_ascii=False))
+
+    # ── Dynamic Panels Management ─────────────────────────────────────────────
+
+    def get_all_panels(self) -> list:
+        """Return all panels as dicts: [{id, name, base_url, api_key, is_active, created_at}]"""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT id, name, base_url, api_key, is_active, created_at FROM panels ORDER BY id ASC"
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "name": r[1],
+                "base_url": r[2],
+                "api_key": r[3],
+                "is_active": bool(r[4]),
+                "created_at": r[5]
+            }
+            for r in rows
+        ]
+
+    def add_panel(self, name: str, base_url: str, api_key: str) -> bool:
+        """Add a new panel into the database."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO panels (name, base_url, api_key, is_active) VALUES (?, ?, ?, 1)",
+                (name.strip(), base_url.strip(), api_key.strip())
+            )
+            conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def toggle_panel_status(self, panel_id: int) -> bool | None:
+        """Toggle panel active/stopped status. Returns new is_active status or None if not found."""
+        conn = self._connect()
+        row = conn.execute("SELECT is_active FROM panels WHERE id = ?", (panel_id,)).fetchone()
+        if not row:
+            return None
+        new_status = 0 if row[0] else 1
+        conn.execute("UPDATE panels SET is_active = ? WHERE id = ?", (new_status, panel_id))
+        conn.commit()
+        return bool(new_status)
+
+    def delete_panel(self, panel_id: int) -> bool:
+        """Delete a panel by ID."""
+        conn = self._connect()
+        cur = conn.execute("DELETE FROM panels WHERE id = ?", (panel_id,))
+        conn.commit()
+        return cur.rowcount > 0
 
 
 db = Database()

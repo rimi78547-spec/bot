@@ -184,7 +184,7 @@ def get_admin_reply_keyboard(checker_enabled=False):
             KeyboardButton("📢 Broadcast Message", style="primary")
         ],
         [
-            KeyboardButton("🗑 Remove Numbers", style="danger"),
+            KeyboardButton("🌐 Manage Panels", style="primary"),
             KeyboardButton("📊 Reports", style="primary")
         ],
         [
@@ -192,10 +192,11 @@ def get_admin_reply_keyboard(checker_enabled=False):
             KeyboardButton("🗑 Remove Service", style="danger")
         ],
         [
-            KeyboardButton(checker_btn_text, style=checker_style),
-            KeyboardButton("🗑 Reset DB", style="danger")
+            KeyboardButton("🗑 Remove Numbers", style="danger"),
+            KeyboardButton(checker_btn_text, style=checker_style)
         ],
         [
+            KeyboardButton("🗑 Reset DB", style="danger"),
             KeyboardButton("👤 User Mode", style="danger")
         ]
     ]
@@ -1340,3 +1341,30 @@ def get_admin_country_keyboard():
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_back", style="danger"),
                      InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel", style="danger")])
     return InlineKeyboardMarkup(keyboard)
+
+def get_admin_panels_keyboard(panels: list):
+    """Inline keyboard for managing panels: list panels with status toggles, add panel, close."""
+    keyboard = []
+    # Button to Add New Panel
+    keyboard.append([
+        InlineKeyboardButton("➕ Add New Panel", callback_data="panel_add_start", style="success")
+    ])
+    
+    # List each panel with toggle and delete
+    for p in panels:
+        p_id = p["id"]
+        name = p["name"]
+        status_icon = "🟢" if p["is_active"] else "🔴"
+        action_text = "Stop" if p["is_active"] else "Start"
+        action_style = "danger" if p["is_active"] else "success"
+        
+        keyboard.append([
+            InlineKeyboardButton(f"{status_icon} {name} ({action_text})", callback_data=f"panel_toggle_{p_id}", style=action_style),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"panel_delete_{p_id}", style="danger")
+        ])
+        
+    keyboard.append([
+        InlineKeyboardButton("❌ Close", callback_data="admin_cancel", style="danger")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
