@@ -14,5 +14,9 @@ env/
 .vscode/
 .idea/
 
+# Sent caches
+*_already_sent.json
+panel_*_sent.json
+
 # Railway / deployment
 *.log
