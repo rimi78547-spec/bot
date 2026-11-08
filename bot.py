@@ -14,8 +14,6 @@ from telegram.ext import (
 from dotenv import load_dotenv
 import ui
 from database import db
-from lamix_monitor import LamixMonitor
-from sevenonetel_monitor import SevenOneTelMonitor
 from generic_panel_monitor import GenericPanelMonitor
 from telegram_checker import check_numbers as checker_check_numbers
 
@@ -1130,15 +1128,8 @@ def main():
 
     application.add_error_handler(error_handler)
 
-    # OTP Monitor loops (Panel 3 Lamix API & Panel 6 SevenOneTel)
-    lamix_monitor = LamixMonitor(application)
-    sevenonetel_monitor = SevenOneTelMonitor(application)
-
     async def post_init(app):
-        await lamix_monitor.start()
-        await sevenonetel_monitor.start()
-
-        # Start any active dynamic panels from database
+        # Start any active dynamic panels added by Admin
         custom_monitors = app.bot_data.setdefault('custom_monitors', {})
         for p in db.get_all_panels():
             if p.get('is_active'):
