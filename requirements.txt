@@ -2,3 +2,5 @@ python-telegram-bot==22.8
 aiohttp
 python-dotenv
 Pillow
+psycopg2-binary
+
