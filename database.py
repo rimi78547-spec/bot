@@ -1,527 +1,683 @@
+import sqlite3
 import os
 import random
 import threading
-import json
-import logging
-import urllib.request
-import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
-logger = logging.getLogger(__name__)
+DB_PATH = os.getenv("DB_PATH", "seven.db")
 
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "https://ovhqorkmwipxpzbxzywh.supabase.co").strip().rstrip("/")
-SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "sb_publishable_Odvhc7PLvccbY9pleKOQmg_xM6Wo-mo").strip()
+
+def _period_sql(period):
+    if period == "today":
+        return "date(created_at) = date('now', 'localtime')", []
+    return "1=1", []
 
 
 class Database:
-    def __init__(self, base_url: str = SUPABASE_URL, api_key: str = SUPABASE_KEY):
-        self.base_url = base_url
-        self.api_key = api_key
-        self.rest_url = f"{self.base_url}/rest/v1"
-        self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler())
-        
-        # High speed in-memory cache for ultra-fast bot response
-        self._cache_lock = threading.Lock()
-        self._stock_cache = {}          # {service: {country: [numbers]}}
-        self._owner_map = {}            # {number: chat_id}
-        self._owner_info = {}           # {number: (chat_id, name)}
-        self._users_cache = set()       # {chat_id}
-        self._processed_hashes = set()  # {msg_hash}
-        self._services_cache = None     # [services]
-        self._settings_cache = {}       # {key: val}
-        self._panels_cache = None       # [panels]
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._local = threading.local()      # per-thread connection
+        self._write_lock = threading.Lock()  # serialize writes
+        self._init_db()
 
-        # Initial fast preload from Cloud Supabase
-        self.reload_cache()
+    def _connect(self) -> sqlite3.Connection:
+        """Return a per-thread SQLite connection with WAL mode enabled."""
+        if not getattr(self._local, "conn", None):
+            conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=10,
+            )
+            conn.execute("PRAGMA journal_mode=WAL")   # concurrent reads
+            conn.execute("PRAGMA synchronous=NORMAL") # faster writes, still safe
+            conn.execute("PRAGMA cache_size=-8000")   # 8 MB cache per connection
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn = conn
+        return self._local.conn
 
-    def _headers(self, prefer=None) -> dict:
-        h = {
-            "apikey": self.api_key,
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if prefer:
-            h["Prefer"] = prefer
-        return h
+    def _init_db(self):
+        conn = self._connect()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                msg_hash TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS numbers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL UNIQUE,
+                service TEXT NOT NULL,
+                country TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'available',
+                owner_chat_id INTEGER,
+                owner_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                assigned_at TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS otps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL,
+                service TEXT,
+                otp TEXT,
+                msg_hash TEXT UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS panels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
 
-    def _req(self, endpoint: str, method: str = "GET", params: dict = None, json_data: any = None, prefer: str = None):
-        url = f"{self.rest_url}/{endpoint}"
-        if params:
-            query = urllib.parse.urlencode(params)
-            url = f"{url}?{query}"
-        
-        data_bytes = None
-        if json_data is not None:
-            data_bytes = json.dumps(json_data).encode("utf-8")
-
-        req = urllib.request.Request(url, data=data_bytes, headers=self._headers(prefer), method=method)
-        try:
-            with self._opener.open(req, timeout=10) as res:
-                body = res.read().decode("utf-8")
-                if not body:
-                    return None
-                try:
-                    return json.loads(body)
-                except Exception:
-                    return body
-        except Exception as e:
-            logger.error(f"Supabase REST error [{method} {endpoint}]: {e}")
-            return None
-
-    def reload_cache(self):
-        """Preload active state from Supabase into memory for ultra-fast instant lookups."""
-        try:
-            # 1. Available Numbers (Stock)
-            res = self._req("numbers", params={"status": "eq.available", "select": "service,country,number"})
-            new_stock = {}
-            if isinstance(res, list):
-                for r in res:
-                    s = (r.get("service") or "").upper()
-                    c = (r.get("country") or "").upper()
-                    n = str(r.get("number")).strip()
-                    if s and c and n:
-                        new_stock.setdefault(s, {}).setdefault(c, []).append(n)
-
-            # 2. Number Ownership Map
-            res_assigned = self._req("numbers", params={"owner_chat_id": "not.is.null", "select": "number,owner_chat_id,owner_name"})
-            new_owner_map = {}
-            new_owner_info = {}
-            if isinstance(res_assigned, list):
-                for r in res_assigned:
-                    cid = r.get("owner_chat_id")
-                    name = r.get("owner_name")
-                    n_str = str(r.get("number")).strip()
-                    clean = n_str.lstrip("+")
-                    new_owner_map[n_str] = cid
-                    new_owner_map[clean] = cid
-                    new_owner_map[f"+{clean}"] = cid
-                    info = (cid, name)
-                    new_owner_info[n_str] = info
-                    new_owner_info[clean] = info
-                    new_owner_info[f"+{clean}"] = info
-
-            # 3. Users
-            res_users = self._req("users", params={"select": "chat_id"})
-            new_users = set()
-            if isinstance(res_users, list):
-                for u in res_users:
-                    if u.get("chat_id"):
-                        new_users.add(u["chat_id"])
-
-            with self._cache_lock:
-                self._stock_cache = new_stock
-                self._owner_map = new_owner_map
-                self._owner_info = new_owner_info
-                self._users_cache = new_users
-
-            logger.info("Ultra-fast cache reloaded successfully from Supabase!")
-        except Exception as e:
-            logger.error(f"Error during cache preload: {e}")
-
-    # ── Processed messages (Monitor) ────────────────────────────────────────
+    # ── processed messages (monitor) ──────────────────────────────────────────
 
     async def is_msg_processed(self, msg_hash: str) -> bool:
-        if msg_hash in self._processed_hashes:
-            return True
-        res = self._req("processed_messages", params={"msg_hash": f"eq.{msg_hash}", "select": "msg_hash"})
-        if res:
-            self._processed_hashes.add(msg_hash)
-            return True
-        return False
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT 1 FROM processed_messages WHERE msg_hash = ?", (msg_hash,)
+        ).fetchone()
+        return row is not None
 
     async def mark_msg_processed(self, msg_hash: str):
-        self._processed_hashes.add(msg_hash)
-        self._req("processed_messages", method="POST", json_data={"msg_hash": msg_hash}, prefer="resolution=ignore-duplicates")
+        conn = self._connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_messages (msg_hash) VALUES (?)",
+            (msg_hash,),
+        )
+        conn.commit()
 
-    # ── Users ───────────────────────────────────────────────────────────────
+    # ── users ─────────────────────────────────────────────────────────────────
 
     def add_user(self, chat_id: int):
-        if chat_id not in self._users_cache:
-            self._users_cache.add(chat_id)
-            self._req("users", method="POST", json_data={"chat_id": chat_id}, prefer="resolution=ignore-duplicates")
+        conn = self._connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,)
+        )
+        conn.commit()
 
     def get_users(self) -> list:
-        return list(self._users_cache)
+        conn = self._connect()
+        rows = conn.execute("SELECT chat_id FROM users").fetchall()
+        return [r[0] for r in rows]
 
-    # ── Number Pool / Stock (Ultra Fast & Realtime Sync) ─────────────────────
+    # ── number pool / stock ───────────────────────────────────────────────────
 
     def add_numbers(self, service: str, country: str, numbers) -> int:
-        service = service.upper()
-        country = country.upper()
-        clean_nums = []
+        conn = self._connect()
+        added = 0
         for n in numbers:
-            s = str(n).strip()
-            if s and s not in clean_nums:
-                clean_nums.append(s)
+            n = str(n).strip()
+            if not n:
+                continue
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO numbers (number, service, country, status)
+                    VALUES (?, ?, ?, 'available')
+                    """,
+                    (n, service.upper(), country.upper()),
+                )
+                added += 1
+            except sqlite3.IntegrityError:
+                pass  # duplicate, skip
+        conn.commit()
+        return added
 
-        if not clean_nums:
-            return 0
+    def get_available_counts(self) -> dict:
+        """Returns {SERVICE: {COUNTRY: count}} for all available numbers."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT service, country, COUNT(*)
+            FROM numbers
+            WHERE status = 'available'
+            GROUP BY service, country
+            """
+        ).fetchall()
+        result = {}
+        for s, c, cnt in rows:
+            result.setdefault(s, {})[c] = cnt
+        return result
 
-        # Update in-memory stock cache instantly
-        with self._cache_lock:
-            cur_pool = self._stock_cache.setdefault(service, {}).setdefault(country, [])
-            for n in clean_nums:
-                if n not in cur_pool:
-                    cur_pool.append(n)
+    def get_available_countries_for_service(self, service: str) -> list:
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT country, COUNT(*) FROM numbers
+            WHERE service = ? AND status = 'available'
+            GROUP BY country
+            """,
+            (service.upper(),),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
-        # Batch write to Supabase (500 per batch)
-        batch = []
-        for n in clean_nums:
-            batch.append({"number": n, "service": service, "country": country, "status": "available"})
-            if len(batch) >= 500:
-                self._req("numbers", method="POST", json_data=batch, prefer="resolution=ignore-duplicates")
-                batch = []
-        if batch:
-            self._req("numbers", method="POST", json_data=batch, prefer="resolution=ignore-duplicates")
+    def assign_numbers(
+        self,
+        service: str,
+        country: str,
+        chat_id: int,
+        count: int,
+        owner_name: str = None,
+    ) -> list:
+        """Atomically pick `count` random available numbers and assign them."""
+        with self._write_lock:
+            conn = self._connect()
+            rows = conn.execute(
+                """
+                SELECT id, number FROM numbers
+                WHERE service = ? AND country = ? AND status = 'available'
+                """,
+                (service.upper(), country.upper()),
+            ).fetchall()
 
-        return len(clean_nums)
+            if not rows:
+                return []
 
-    def get_stock(self) -> dict:
-        """Return stock instantly from memory without remote HTTP latency."""
-        with self._cache_lock:
-            # Return deep copy so callers can inspect safely
-            return {s: {c: list(nums) for c, nums in cty.items()} for s, cty in self._stock_cache.items()}
+            picked = random.sample(rows, min(count, len(rows)))
+            picked_ids = [r[0] for r in picked]
+            assigned_at = datetime.now(timezone.utc).isoformat()
+
+            placeholders = ",".join("?" * len(picked_ids))
+            conn.execute(
+                f"""
+                UPDATE numbers
+                SET status = 'assigned',
+                    owner_chat_id = ?,
+                    owner_name = ?,
+                    assigned_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [chat_id, owner_name, assigned_at] + picked_ids,
+            )
+            conn.commit()
+            return [r[1] for r in picked]
+
+    def replace_number(
+        self, old_number: str, chat_id: int, owner_name: str = None
+    ) -> str | None:
+        """Mark old_number as 'replaced', pick a new available one for the same service+country."""
+        with self._write_lock:
+            conn = self._connect()
+            row = conn.execute(
+                """
+                SELECT id, service, country FROM numbers
+                WHERE number = ? AND owner_chat_id = ? AND status = 'assigned'
+                """,
+                (old_number, chat_id),
+            ).fetchone()
+
+            if not row:
+                return None
+
+            _old_id, service, country = row
+
+            new_row = conn.execute(
+                """
+                SELECT id, number FROM numbers
+                WHERE service = ? AND country = ? AND status = 'available'
+                ORDER BY RANDOM() LIMIT 1
+                """,
+                (service, country),
+            ).fetchone()
+
+            if not new_row:
+                return None  # out of stock
+
+            new_id, new_number = new_row
+            assigned_at = datetime.now(timezone.utc).isoformat()
+
+            conn.execute(
+                "UPDATE numbers SET status = 'replaced' WHERE number = ?",
+                (old_number,),
+            )
+            conn.execute(
+                """
+                UPDATE numbers
+                SET status = 'assigned',
+                    owner_chat_id = ?,
+                    owner_name = ?,
+                    assigned_at = ?
+                WHERE id = ?
+                """,
+                (chat_id, owner_name, assigned_at, new_id),
+            )
+            conn.commit()
+            return new_number
 
     def get_number_owner_map(self) -> dict:
-        """Instant memory lookup for SMS monitors."""
-        with self._cache_lock:
-            return dict(self._owner_map)
+        """Return {number: chat_id} for all currently assigned numbers."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT number, owner_chat_id FROM numbers
+            WHERE status = 'assigned' AND owner_chat_id IS NOT NULL
+            """
+        ).fetchall()
+        result = {}
+        for num, cid in rows:
+            clean = str(num).strip().lstrip("+")
+            result[str(num).strip()] = cid
+            result[clean] = cid
+            result[f"+{clean}"] = cid
+        return result
 
-    def get_number_owner_info(self, number: str):
-        with self._cache_lock:
-            s = str(number).strip()
-            clean = s.lstrip("+")
-            return self._owner_info.get(s) or self._owner_info.get(clean) or self._owner_info.get(f"+{clean}") or (None, None)
+    def get_number_owner_info(self, number: str) -> tuple | None:
+        """Return (owner_chat_id, owner_name) for a specific number if assigned."""
+        clean = str(number).strip().lstrip("+")
+        conn = self._connect()
+        row = conn.execute(
+            """
+            SELECT owner_chat_id, owner_name FROM numbers
+            WHERE (number = ? OR number = ? OR number = ?)
+              AND status = 'assigned' AND owner_chat_id IS NOT NULL
+            LIMIT 1
+            """,
+            (number.strip(), clean, f"+{clean}"),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
 
-    def release_user_numbers(self, chat_id: int, service: str, country: str = None) -> int:
-        service = service.upper()
-        country = country.upper() if country else None
-        params = {"owner_chat_id": f"eq.{chat_id}", "service": f"eq.{service}", "status": "eq.assigned"}
-        if country:
-            params["country"] = f"eq.{country}"
-        res = self._req("numbers", method="PATCH", params=params, json_data={"status": "replaced"}, prefer="return=representation")
-        return len(res) if isinstance(res, list) else 0
+    # ── admin stock management ────────────────────────────────────────────────
 
-    def reserve_numbers(self, service: str, country: str = None, prefix: str = None, count: int = 5,
-                        shuffle: bool = False, chat_id: int = None, owner_name: str = None) -> list:
-        service = service.upper()
-        country = country.upper() if country else None
-
-        with self._cache_lock:
-            country_dict = self._stock_cache.get(service, {})
-            if country:
-                pool = list(country_dict.get(country, []))
-            else:
-                pool = [n for nums in country_dict.values() for n in nums]
-
-            if prefix:
-                clean_pref = str(prefix).strip().lstrip("+")
-                pool = [
-                    n for n in pool
-                    if str(n).strip().startswith(str(prefix).strip())
-                    or str(n).strip().lstrip("+").startswith(clean_pref)
-                ]
-
-            if not pool:
-                return []
-
-            if shuffle:
-                random.shuffle(pool)
-
-            take = pool[:count]
-            if not take:
-                return []
-
-            take_set = set(take)
-
-            # Instantly remove reserved from in-memory cache
-            for c_key in list(country_dict.keys()):
-                country_dict[c_key] = [n for n in country_dict[c_key] if n not in take_set]
-
-            # Instantly register ownership in cache
-            if chat_id:
-                for n in take:
-                    n_str = str(n).strip()
-                    clean = n_str.lstrip("+")
-                    self._owner_map[n_str] = chat_id
-                    self._owner_map[clean] = chat_id
-                    self._owner_map[f"+{clean}"] = chat_id
-                    info = (chat_id, owner_name)
-                    self._owner_info[n_str] = info
-                    self._owner_info[clean] = info
-                    self._owner_info[f"+{clean}"] = info
-
-        # Sync update in Supabase background
-        now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        num_list_str = f"({','.join(take)})"
-        self._req(
-            "numbers",
-            method="PATCH",
-            params={"number": f"in.{num_list_str}"},
-            json_data={
-                "status": "assigned",
-                "owner_chat_id": chat_id,
-                "owner_name": owner_name,
-                "assigned_at": now_ts
-            }
+    def delete_numbers_by_country(self, country: str) -> int:
+        conn = self._connect()
+        cur = conn.execute(
+            "DELETE FROM numbers WHERE country = ?", (country.upper(),)
         )
-        return take
+        conn.commit()
+        return cur.rowcount
 
-    def remove_numbers(self, service: str, country: str) -> int:
-        service = service.upper()
-        country = country.upper()
-        with self._cache_lock:
-            if service in self._stock_cache and country in self._stock_cache[service]:
-                del self._stock_cache[service][country]
+    def delete_numbers_by_service(self, service: str) -> int:
+        conn = self._connect()
+        cur = conn.execute(
+            "DELETE FROM numbers WHERE service = ?", (service.upper(),)
+        )
+        conn.commit()
+        return cur.rowcount
 
-        res = self._req("numbers", method="DELETE", params={"service": f"eq.{service}", "country": f"eq.{country}"}, prefer="return=representation")
-        return len(res) if isinstance(res, list) else 0
+    def clear_all_numbers(self) -> int:
+        conn = self._connect()
+        cur = conn.execute("DELETE FROM numbers")
+        conn.commit()
+        return cur.rowcount
 
     def get_stock_summary(self) -> list:
-        res = self._req("numbers", params={"select": "service,country,status"})
-        summary = {}
-        if isinstance(res, list):
-            for r in res:
-                key = (r.get("service"), r.get("country"))
-                if key not in summary:
-                    summary[key] = {"total": 0, "available": 0, "assigned": 0}
-                summary[key]["total"] += 1
-                if r.get("status") == "available":
-                    summary[key]["available"] += 1
-                elif r.get("status") == "assigned":
-                    summary[key]["assigned"] += 1
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT service, country,
+                   SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS avail,
+                   SUM(CASE WHEN status = 'assigned'  THEN 1 ELSE 0 END) AS assigned,
+                   COUNT(*) AS total
+            FROM numbers
+            GROUP BY service, country
+            ORDER BY service, country
+            """
+        ).fetchall()
+        return rows
 
-        return [
-            (k[0], k[1], v["total"], v["available"], v["assigned"])
-            for k, v in sorted(summary.items())
-        ]
+    def search_numbers(self, query: str, limit: int = 20) -> list:
+        """Search numbers table by partial phone number or country."""
+        conn = self._connect()
+        clean = query.strip().lstrip("+")
+        like_expr = f"%{clean}%"
+        rows = conn.execute(
+            """
+            SELECT number, service, country, status, owner_chat_id, owner_name, assigned_at
+            FROM numbers
+            WHERE number LIKE ? OR country LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (like_expr, f"%{query.strip().upper()}%", limit),
+        ).fetchall()
+        return rows
 
-    def reset_db(self):
-        with self._cache_lock:
-            self._stock_cache.clear()
-            self._owner_map.clear()
-            self._owner_info.clear()
-        self._req("numbers", method="DELETE", params={"id": "gt.0"})
-        self._req("otps", method="DELETE", params={"id": "gt.0"})
-        self._req("processed_messages", method="DELETE", params={"created_at": "not.is.null"})
+    def reset_assigned_numbers(self, service: str = None, country: str = None) -> int:
+        """Reset assigned/replaced numbers back to available."""
+        with self._write_lock:
+            conn = self._connect()
+            conditions = ["status IN ('assigned', 'replaced')"]
+            params = []
+            if service:
+                conditions.append("service = ?")
+                params.append(service.upper())
+            if country:
+                conditions.append("country = ?")
+                params.append(country.upper())
 
-    # ── OTP tracking / reports ──────────────────────────────────────────────
+            sql = f"""
+                UPDATE numbers
+                SET status = 'available',
+                    owner_chat_id = NULL,
+                    owner_name = NULL,
+                    assigned_at = NULL
+                WHERE {' AND '.join(conditions)}
+            """
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.rowcount
 
-    def log_otp(self, number, service=None, otp=None, msg_hash=None):
-        self._req(
-            "otps",
-            method="POST",
-            json_data={"number": str(number), "service": service, "otp": otp, "msg_hash": msg_hash},
-            prefer="resolution=ignore-duplicates"
+    def check_existing_numbers(self, numbers: list) -> set:
+        """Return the subset of `numbers` that already exist in the database."""
+        if not numbers:
+            return set()
+        conn = self._connect()
+        existing = set()
+        chunk_size = 500
+        clean_nums = [str(n).strip() for n in numbers if str(n).strip()]
+        for i in range(0, len(clean_nums), chunk_size):
+            chunk = clean_nums[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT number FROM numbers WHERE number IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            existing.update(r[0] for r in rows)
+        return existing
+
+    # ── otps ──────────────────────────────────────────────────────────────────
+
+    def log_otp(self, number: str, service: str, otp: str, msg_hash: str):
+        conn = self._connect()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO otps (number, service, otp, msg_hash)
+            VALUES (?, ?, ?, ?)
+            """,
+            (number, service, otp, msg_hash),
         )
+        conn.commit()
 
-    def otp_summary(self, period="all") -> list:
-        otps_res = self._req("otps", params={"select": "number,created_at"})
-        if not isinstance(otps_res, list) or not otps_res:
-            return []
+    def get_otp_stats(self, period: str = "all") -> dict:
+        """Returns total OTPs and breakdown by service. period: 'today' or 'all'."""
+        conn = self._connect()
+        where_clause, args = _period_sql(period)
 
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
-        filtered_otps = []
-        for o in otps_res:
-            if period == "today" and not str(o.get("created_at", "")).startswith(today_str):
-                continue
-            filtered_otps.append(o.get("number"))
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM otps WHERE {where_clause}", args
+        ).fetchone()[0]
 
-        nums_res = self._req("numbers", params={"select": "number,owner_chat_id,owner_name"})
-        num_map = {}
-        if isinstance(nums_res, list):
-            for nr in nums_res:
-                num_map[str(nr.get("number")).lstrip("+")] = (nr.get("owner_name") or "—", nr.get("owner_chat_id"))
+        by_service = conn.execute(
+            f"""
+            SELECT service, COUNT(*) FROM otps
+            WHERE {where_clause}
+            GROUP BY service
+            ORDER BY COUNT(*) DESC
+            """,
+            args,
+        ).fetchall()
 
-        user_summary = {}
-        for num in filtered_otps:
-            clean = str(num).lstrip("+")
-            owner_name, cid = num_map.get(clean, ("—", None))
-            key = (owner_name, cid)
-            if key not in user_summary:
-                user_summary[key] = {"numbers": set(), "count": 0}
-            user_summary[key]["numbers"].add(clean)
-            user_summary[key]["count"] += 1
+        by_country = conn.execute(
+            f"""
+            SELECT n.country, COUNT(o.id)
+            FROM otps o
+            LEFT JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
+            WHERE {where_clause}
+            GROUP BY n.country
+            ORDER BY COUNT(o.id) DESC
+            """,
+            args,
+        ).fetchall()
 
-        return [
-            (k[0], k[1], len(v["numbers"]), v["count"])
-            for k, v in sorted(user_summary.items(), key=lambda x: x[1]["count"], reverse=True)
-        ]
+        return {
+            "total": total,
+            "by_service": by_service,
+            "by_country": by_country,
+        }
 
-    def numbers_with_otp(self, period="all") -> list:
-        res = self._req("otps", params={"select": "number,created_at"})
-        if not isinstance(res, list):
-            return []
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
-        nums = set()
-        for r in res:
-            if period == "today" and not str(r.get("created_at", "")).startswith(today_str):
-                continue
-            nums.add(r.get("number"))
-        return list(nums)
+    def get_user_otp_stats(self, chat_id: int, period: str = "all") -> dict:
+        """Return OTP counts for numbers owned by a specific user."""
+        conn = self._connect()
+        where_cond, args = _period_sql(period)
 
-    def numbers_without_otp(self, period="all") -> list:
-        with_otps = set(self.numbers_with_otp(period))
-        assigned = self._req("numbers", params={"status": "eq.assigned", "select": "number"})
-        res = []
-        if isinstance(assigned, list):
-            for a in assigned:
-                n = a.get("number")
-                if n not in with_otps and str(n).lstrip("+") not in with_otps:
-                    res.append(n)
-        return res
+        total = conn.execute(
+            f"""
+            SELECT COUNT(o.id)
+            FROM otps o
+            INNER JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
+            WHERE n.owner_chat_id = ? AND {where_cond}
+            """,
+            [chat_id] + args,
+        ).fetchone()[0]
+
+        by_service = conn.execute(
+            f"""
+            SELECT o.service, COUNT(o.id)
+            FROM otps o
+            INNER JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
+            WHERE n.owner_chat_id = ? AND {where_cond}
+            GROUP BY o.service
+            ORDER BY COUNT(o.id) DESC
+            """,
+            [chat_id] + args,
+        ).fetchall()
+
+        return {"total": total, "by_service": by_service}
+
+    def get_unusable_numbers(self, chat_id: int) -> list:
+        """Return assigned numbers for chat_id that have NEVER received an OTP."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT n.number
+            FROM numbers n
+            WHERE n.owner_chat_id = ?
+              AND n.status = 'assigned'
+              AND NOT EXISTS (
+                  SELECT 1 FROM otps o
+                  WHERE ltrim(o.number, '+') = ltrim(n.number, '+')
+              )
+            ORDER BY n.assigned_at DESC
+            """,
+            (chat_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def get_user_otp_stats_and_history(self, chat_id: int, limit: int = 20):
         """Calculate Bangladesh Time 6AM-6AM stats and return (today_count, total_count, history)."""
-        from datetime import datetime, timezone, timedelta
+        conn = self._connect()
         
-        nums_res = self._req("numbers", params={"owner_chat_id": f"eq.{chat_id}", "select": "number"})
-        if not isinstance(nums_res, list) or not nums_res:
-            return 0, 0, []
+        # All OTPs for numbers owned by this user
+        rows = conn.execute(
+            """
+            SELECT o.number, o.service, o.otp, o.created_at
+            FROM otps o
+            INNER JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
+            WHERE n.owner_chat_id = ?
+            ORDER BY o.created_at DESC
+            """,
+            (chat_id,),
+        ).fetchall()
 
-        clean_nums = set(str(r["number"]).lstrip("+") for r in nums_res)
-        
-        # All OTPs for matching
-        otps_res = self._req("otps", params={"select": "number,service,otp,created_at", "order": "created_at.desc"})
-        if not isinstance(otps_res, list) or not otps_res:
+        if not rows:
             return 0, 0, []
 
         # BD Time (UTC+6)
         bd_tz = timezone(timedelta(hours=6))
         now_bd = datetime.now(bd_tz)
         
-        # BD 6AM window: if now is before 6AM, window started yesterday at 6AM, else today at 6AM
         if now_bd.hour < 6:
             start_bd = now_bd.replace(hour=6, minute=0, second=0, microsecond=0) - timedelta(days=1)
         else:
             start_bd = now_bd.replace(hour=6, minute=0, second=0, microsecond=0)
         
-        # Start in UTC
         start_utc = start_bd.astimezone(timezone.utc)
 
         today_count = 0
-        total_count = 0
+        total_count = len(rows)
         history = []
 
-        for o in otps_res:
-            num_clean = str(o.get("number", "")).lstrip("+")
-            if num_clean in clean_nums:
-                total_count += 1
-                created_str = str(o.get("created_at", ""))
-                # Parse created_at
-                try:
-                    dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    if dt >= start_utc:
-                        today_count += 1
-                except Exception:
-                    pass
+        for r in rows:
+            created_str = str(r[3])
+            try:
+                dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt >= start_utc:
+                    today_count += 1
+            except Exception:
+                pass
 
-                if len(history) < limit:
-                    history.append((o.get("number"), o.get("service"), o.get("otp"), o.get("created_at")))
+            if len(history) < limit:
+                history.append((r[0], r[1], r[2], r[3]))
 
         return today_count, total_count, history
 
     def get_user_otp_history(self, chat_id: int, limit: int = 20) -> list:
-        nums_res = self._req("numbers", params={"owner_chat_id": f"eq.{chat_id}", "select": "number"})
-        if not isinstance(nums_res, list) or not nums_res:
-            return []
-        clean_nums = [str(r["number"]).lstrip("+") for r in nums_res]
-        otps_res = self._req("otps", params={"select": "number,service,otp,created_at", "order": "created_at.desc", "limit": str(limit)})
-        matches = []
-        if isinstance(otps_res, list):
-            for o in otps_res:
-                if str(o.get("number")).lstrip("+") in clean_nums:
-                    matches.append((o.get("number"), o.get("service"), o.get("otp"), o.get("created_at")))
-        return matches
+        """Return the last `limit` OTPs received for numbers owned by chat_id.
+        Returns list of (number, service, otp, created_at).
+        """
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT o.number, o.service, o.otp, o.created_at
+            FROM otps o
+            INNER JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
+            WHERE n.owner_chat_id = ?
+            ORDER BY o.created_at DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+        return [tuple(r) for r in rows]
 
     def get_user_numbers(self, chat_id: int) -> list:
-        res = self._req("numbers", params={"owner_chat_id": f"eq.{chat_id}", "select": "number,service,country,assigned_at", "order": "assigned_at.desc"})
-        if isinstance(res, list):
-            return [(r.get("number"), r.get("service"), r.get("country"), r.get("assigned_at")) for r in res]
-        return []
+        """Return all numbers currently assigned to chat_id.
+        Returns list of (number, service, country, assigned_at).
+        """
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT number, service, country, assigned_at
+            FROM numbers WHERE owner_chat_id = ?
+            ORDER BY assigned_at DESC
+            """,
+            (chat_id,),
+        ).fetchall()
+        return [tuple(r) for r in rows]
 
     def get_setting(self, key: str, default: str = None) -> str:
-        if key in self._settings_cache:
-            return self._settings_cache[key]
-        res = self._req("settings", params={"key": f"eq.{key}", "select": "value"})
-        if isinstance(res, list) and res:
-            val = res[0].get("value")
-            self._settings_cache[key] = val
-            return val
-        return default
+        conn = self._connect()
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
 
     def set_setting(self, key: str, value: str):
-        self._settings_cache[key] = str(value)
-        self._req("settings", method="POST", json_data={"key": key, "value": str(value)}, prefer="resolution=merge-duplicates")
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value))
+        )
+        conn.commit()
 
-    # ── Dynamic Services ────────────────────────────────────────────────────
+    # ── Dynamic services ──────────────────────────────────────────────────────
 
     _DEFAULT_SERVICES = [
-        {"label": "💬 IMO", "name": "IMO"},
+        {"label": "💬 IMO",      "name": "IMO"},
         {"label": "🫆 TELEGRAM", "name": "TELEGRAM"},
-        {"label": "🧊 VK", "name": "VK"},
+        {"label": "🧊 VK",       "name": "VK"},
         {"label": "🟢 WHATSAPP", "name": "WHATSAPP"},
     ]
 
     def get_services(self) -> list:
-        if self._services_cache is not None:
-            return self._services_cache
+        """Return list of {label, name} dicts. Seeds defaults if not yet saved."""
+        import json
         raw = self.get_setting("services")
         if raw:
             try:
-                self._services_cache = json.loads(raw)
-                return self._services_cache
+                return json.loads(raw)
             except Exception:
                 pass
-        self._services_cache = list(self._DEFAULT_SERVICES)
         self.save_services(self._DEFAULT_SERVICES)
-        return self._services_cache
+        return list(self._DEFAULT_SERVICES)
 
     def save_services(self, services: list):
-        self._services_cache = list(services)
+        """Persist services list (list of {label, name}) to settings."""
+        import json
         self.set_setting("services", json.dumps(services, ensure_ascii=False))
 
-    # ── Dynamic Panels Management ───────────────────────────────────────────
+    # ── Dynamic Panels Management ─────────────────────────────────────────────
 
     def get_all_panels(self) -> list:
-        res = self._req("panels", params={"select": "id,name,base_url,api_key,is_active,created_at", "order": "id.asc"})
-        if isinstance(res, list):
-            self._panels_cache = [
-                {
-                    "id": r.get("id"),
-                    "name": r.get("name"),
-                    "base_url": r.get("base_url"),
-                    "api_key": r.get("api_key"),
-                    "is_active": bool(r.get("is_active")),
-                    "created_at": r.get("created_at")
-                }
-                for r in res
-            ]
-            return self._panels_cache
-        return self._panels_cache or []
+        """Return all panels as dicts: [{id, name, base_url, api_key, is_active, created_at}]"""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT id, name, base_url, api_key, is_active, created_at FROM panels ORDER BY id ASC"
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "name": r[1],
+                "base_url": r[2],
+                "api_key": r[3],
+                "is_active": bool(r[4]),
+                "created_at": r[5]
+            }
+            for r in rows
+        ]
 
     def add_panel(self, name: str, base_url: str, api_key: str) -> bool:
-        res = self._req("panels", method="POST", json_data={"name": name.strip(), "base_url": base_url.strip(), "api_key": api_key.strip(), "is_active": 1})
-        self.get_all_panels()
-        return res is not None
+        """Add a new panel into the database."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO panels (name, base_url, api_key, is_active) VALUES (?, ?, ?, 1)",
+                (name.strip(), base_url.strip(), api_key.strip())
+            )
+            conn.commit()
+            return True
+        except Exception:
+            return False
 
     def toggle_panel_status(self, panel_id: int) -> bool | None:
-        res = self._req("panels", params={"id": f"eq.{panel_id}", "select": "is_active"})
-        if isinstance(res, list) and res:
-            current = bool(res[0].get("is_active"))
-            new_status = 0 if current else 1
-            self._req("panels", method="PATCH", params={"id": f"eq.{panel_id}"}, json_data={"is_active": new_status})
-            self.get_all_panels()
-            return bool(new_status)
-        return None
+        """Toggle panel active/stopped status. Returns new is_active status or None if not found."""
+        conn = self._connect()
+        row = conn.execute("SELECT is_active FROM panels WHERE id = ?", (panel_id,)).fetchone()
+        if not row:
+            return None
+        new_status = 0 if row[0] else 1
+        conn.execute("UPDATE panels SET is_active = ? WHERE id = ?", (new_status, panel_id))
+        conn.commit()
+        return bool(new_status)
 
     def delete_panel(self, panel_id: int) -> bool:
-        res = self._req("panels", method="DELETE", params={"id": f"eq.{panel_id}"}, prefer="return=representation")
-        self.get_all_panels()
-        return bool(res)
+        """Delete a panel by ID."""
+        conn = self._connect()
+        cur = conn.execute("DELETE FROM panels WHERE id = ?", (panel_id,))
+        conn.commit()
+        return cur.rowcount > 0
 
 
 db = Database()
