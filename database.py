@@ -156,6 +156,17 @@ class Database:
         conn.commit()
         return added
 
+    def get_stock(self) -> dict:
+        """Returns {SERVICE: {COUNTRY: [numbers]}} for all available numbers."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT service, country, number FROM numbers WHERE status = 'available'"
+        ).fetchall()
+        stock = {}
+        for service, country, number in rows:
+            stock.setdefault(service, {}).setdefault(country, []).append(number)
+        return stock
+
     def get_available_counts(self) -> dict:
         """Returns {SERVICE: {COUNTRY: count}} for all available numbers."""
         conn = self._connect()
@@ -172,337 +183,165 @@ class Database:
             result.setdefault(s, {})[c] = cnt
         return result
 
-    def get_available_countries_for_service(self, service: str) -> list:
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT country, COUNT(*) FROM numbers
-            WHERE service = ? AND status = 'available'
-            GROUP BY country
-            """,
-            (service.upper(),),
-        ).fetchall()
-        return [(r[0], r[1]) for r in rows]
-
-    def assign_numbers(
-        self,
-        service: str,
-        country: str,
-        chat_id: int,
-        count: int,
-        owner_name: str = None,
-    ) -> list:
-        """Atomically pick `count` random available numbers and assign them."""
-        with self._write_lock:
-            conn = self._connect()
-            rows = conn.execute(
-                """
-                SELECT id, number FROM numbers
-                WHERE service = ? AND country = ? AND status = 'available'
-                """,
-                (service.upper(), country.upper()),
-            ).fetchall()
-
-            if not rows:
-                return []
-
-            picked = random.sample(rows, min(count, len(rows)))
-            picked_ids = [r[0] for r in picked]
-            assigned_at = datetime.now(timezone.utc).isoformat()
-
-            placeholders = ",".join("?" * len(picked_ids))
-            conn.execute(
-                f"""
-                UPDATE numbers
-                SET status = 'assigned',
-                    owner_chat_id = ?,
-                    owner_name = ?,
-                    assigned_at = ?
-                WHERE id IN ({placeholders})
-                """,
-                [chat_id, owner_name, assigned_at] + picked_ids,
-            )
-            conn.commit()
-            return [r[1] for r in picked]
-
-    def replace_number(
-        self, old_number: str, chat_id: int, owner_name: str = None
-    ) -> str | None:
-        """Mark old_number as 'replaced', pick a new available one for the same service+country."""
-        with self._write_lock:
-            conn = self._connect()
-            row = conn.execute(
-                """
-                SELECT id, service, country FROM numbers
-                WHERE number = ? AND owner_chat_id = ? AND status = 'assigned'
-                """,
-                (old_number, chat_id),
-            ).fetchone()
-
-            if not row:
-                return None
-
-            _old_id, service, country = row
-
-            new_row = conn.execute(
-                """
-                SELECT id, number FROM numbers
-                WHERE service = ? AND country = ? AND status = 'available'
-                ORDER BY RANDOM() LIMIT 1
-                """,
-                (service, country),
-            ).fetchone()
-
-            if not new_row:
-                return None  # out of stock
-
-            new_id, new_number = new_row
-            assigned_at = datetime.now(timezone.utc).isoformat()
-
-            conn.execute(
-                "UPDATE numbers SET status = 'replaced' WHERE number = ?",
-                (old_number,),
-            )
-            conn.execute(
-                """
-                UPDATE numbers
-                SET status = 'assigned',
-                    owner_chat_id = ?,
-                    owner_name = ?,
-                    assigned_at = ?
-                WHERE id = ?
-                """,
-                (chat_id, owner_name, assigned_at, new_id),
-            )
-            conn.commit()
-            return new_number
-
     def get_number_owner_map(self) -> dict:
-        """Return {number: chat_id} for all currently assigned numbers."""
+        """Return {number: chat_id} for all assigned and replaced numbers."""
         conn = self._connect()
         rows = conn.execute(
             """
             SELECT number, owner_chat_id FROM numbers
-            WHERE status = 'assigned' AND owner_chat_id IS NOT NULL
+            WHERE owner_chat_id IS NOT NULL AND status IN ('assigned', 'replaced')
             """
         ).fetchall()
-        result = {}
-        for num, cid in rows:
-            clean = str(num).strip().lstrip("+")
-            result[str(num).strip()] = cid
-            result[clean] = cid
-            result[f"+{clean}"] = cid
-        return result
+        mapping = {}
+        for n, c in rows:
+            s = str(n).strip()
+            clean = s.lstrip('+')
+            mapping[s] = c
+            mapping[clean] = c
+            mapping[f"+{clean}"] = c
+        return mapping
 
-    def get_number_owner_info(self, number: str) -> tuple | None:
-        """Return (owner_chat_id, owner_name) for a specific number if assigned."""
-        clean = str(number).strip().lstrip("+")
+    def get_number_owner_info(self, number: str):
         conn = self._connect()
+        s = str(number).strip()
+        clean = s.lstrip('+')
         row = conn.execute(
             """
             SELECT owner_chat_id, owner_name FROM numbers
-            WHERE (number = ? OR number = ? OR number = ?)
-              AND status = 'assigned' AND owner_chat_id IS NOT NULL
+            WHERE (number = ? OR number = ? OR number = ?) AND owner_chat_id IS NOT NULL
             LIMIT 1
             """,
-            (number.strip(), clean, f"+{clean}"),
+            (s, clean, f"+{clean}")
         ).fetchone()
-        return (row[0], row[1]) if row else None
+        if row:
+            return row[0], row[1]
+        return None, None
 
-    # ── admin stock management ────────────────────────────────────────────────
-
-    def delete_numbers_by_country(self, country: str) -> int:
+    def release_user_numbers(self, chat_id: int, service: str, country: str = None) -> int:
         conn = self._connect()
+        where = ["owner_chat_id = ?", "service = ?", "status = 'assigned'"]
+        args = [chat_id, service]
+        if country:
+            where.append("country = ?")
+            args.append(country)
         cur = conn.execute(
-            "DELETE FROM numbers WHERE country = ?", (country.upper(),)
+            f"UPDATE numbers SET status = 'replaced' WHERE {' AND '.join(where)}",
+            args,
         )
         conn.commit()
         return cur.rowcount
 
-    def delete_numbers_by_service(self, service: str) -> int:
+    def reserve_numbers(self, service, country=None, prefix=None, count=5,
+                        shuffle=False, chat_id=None, owner_name=None) -> list:
         conn = self._connect()
-        cur = conn.execute(
-            "DELETE FROM numbers WHERE service = ?", (service.upper(),)
+        where = ["service = ?", "status = 'available'"]
+        args = [service]
+        if country:
+            where.append("country = ?")
+            args.append(country)
+        rows = conn.execute(
+            f"SELECT number FROM numbers WHERE {' AND '.join(where)}", args
+        ).fetchall()
+        pool = [r[0] for r in rows]
+        if prefix:
+            clean_pref = str(prefix).strip().lstrip('+')
+            pool = [
+                n for n in pool
+                if str(n).strip().startswith(str(prefix).strip())
+                or str(n).strip().lstrip('+').startswith(clean_pref)
+            ]
+        if shuffle:
+            random.shuffle(pool)
+        take = pool[:count]
+        if not take:
+            return []
+        qmarks = ",".join("?" for _ in take)
+        conn.execute(
+            f"UPDATE numbers SET status = 'assigned', owner_chat_id = ?, owner_name = ?, "
+            f"assigned_at = CURRENT_TIMESTAMP WHERE number IN ({qmarks})",
+            [chat_id, owner_name] + take,
         )
         conn.commit()
-        return cur.rowcount
+        return take
 
-    def clear_all_numbers(self) -> int:
+    def remove_numbers(self, service: str, country: str) -> int:
+        """Remove ALL numbers (available + assigned) for a given service + country."""
         conn = self._connect()
-        cur = conn.execute("DELETE FROM numbers")
+        cur = conn.execute(
+            "DELETE FROM numbers WHERE service = ? AND country = ?",
+            (service, country),
+        )
         conn.commit()
         return cur.rowcount
 
     def get_stock_summary(self) -> list:
+        """Return list of (service, country, total_count, available_count, assigned_count)."""
         conn = self._connect()
         rows = conn.execute(
-            """
-            SELECT service, country,
-                   SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS avail,
-                   SUM(CASE WHEN status = 'assigned'  THEN 1 ELSE 0 END) AS assigned,
-                   COUNT(*) AS total
-            FROM numbers
-            GROUP BY service, country
-            ORDER BY service, country
-            """
+            "SELECT service, country, COUNT(*) as total, "
+            "SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) as avail, "
+            "SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END) as assigned "
+            "FROM numbers GROUP BY service, country ORDER BY service, country"
         ).fetchall()
-        return rows
+        return [tuple(r) for r in rows]
 
-    def search_numbers(self, query: str, limit: int = 20) -> list:
-        """Search numbers table by partial phone number or country."""
+    def reset_db(self):
+        """Drop all data tables and recreate them (full reset)."""
         conn = self._connect()
-        clean = query.strip().lstrip("+")
-        like_expr = f"%{clean}%"
-        rows = conn.execute(
-            """
-            SELECT number, service, country, status, owner_chat_id, owner_name, assigned_at
-            FROM numbers
-            WHERE number LIKE ? OR country LIKE ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (like_expr, f"%{query.strip().upper()}%", limit),
-        ).fetchall()
-        return rows
-
-    def reset_assigned_numbers(self, service: str = None, country: str = None) -> int:
-        """Reset assigned/replaced numbers back to available."""
-        with self._write_lock:
-            conn = self._connect()
-            conditions = ["status IN ('assigned', 'replaced')"]
-            params = []
-            if service:
-                conditions.append("service = ?")
-                params.append(service.upper())
-            if country:
-                conditions.append("country = ?")
-                params.append(country.upper())
-
-            sql = f"""
-                UPDATE numbers
-                SET status = 'available',
-                    owner_chat_id = NULL,
-                    owner_name = NULL,
-                    assigned_at = NULL
-                WHERE {' AND '.join(conditions)}
-            """
-            cur = conn.execute(sql, params)
-            conn.commit()
-            return cur.rowcount
-
-    def check_existing_numbers(self, numbers: list) -> set:
-        """Return the subset of `numbers` that already exist in the database."""
-        if not numbers:
-            return set()
-        conn = self._connect()
-        existing = set()
-        chunk_size = 500
-        clean_nums = [str(n).strip() for n in numbers if str(n).strip()]
-        for i in range(0, len(clean_nums), chunk_size):
-            chunk = clean_nums[i:i + chunk_size]
-            placeholders = ",".join("?" * len(chunk))
-            rows = conn.execute(
-                f"SELECT number FROM numbers WHERE number IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            existing.update(r[0] for r in rows)
-        return existing
+        conn.execute("DELETE FROM numbers")
+        conn.execute("DELETE FROM otps")
+        conn.execute("DELETE FROM processed_messages")
+        conn.commit()
 
     # ── otps ──────────────────────────────────────────────────────────────────
 
-    def log_otp(self, number: str, service: str, otp: str, msg_hash: str):
+    def log_otp(self, number, service=None, otp=None, msg_hash=None):
         conn = self._connect()
         conn.execute(
-            """
-            INSERT OR IGNORE INTO otps (number, service, otp, msg_hash)
-            VALUES (?, ?, ?, ?)
-            """,
-            (number, service, otp, msg_hash),
+            "INSERT OR IGNORE INTO otps (number, service, otp, msg_hash) VALUES (?, ?, ?, ?)",
+            (str(number), service, otp, msg_hash),
         )
         conn.commit()
 
-    def get_otp_stats(self, period: str = "all") -> dict:
-        """Returns total OTPs and breakdown by service. period: 'today' or 'all'."""
-        conn = self._connect()
-        where_clause, args = _period_sql(period)
-
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM otps WHERE {where_clause}", args
-        ).fetchone()[0]
-
-        by_service = conn.execute(
-            f"""
-            SELECT service, COUNT(*) FROM otps
-            WHERE {where_clause}
-            GROUP BY service
-            ORDER BY COUNT(*) DESC
-            """,
-            args,
-        ).fetchall()
-
-        by_country = conn.execute(
-            f"""
-            SELECT n.country, COUNT(o.id)
-            FROM otps o
-            LEFT JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
-            WHERE {where_clause}
-            GROUP BY n.country
-            ORDER BY COUNT(o.id) DESC
-            """,
-            args,
-        ).fetchall()
-
-        return {
-            "total": total,
-            "by_service": by_service,
-            "by_country": by_country,
-        }
-
-    def get_user_otp_stats(self, chat_id: int, period: str = "all") -> dict:
-        """Return OTP counts for numbers owned by a specific user."""
-        conn = self._connect()
-        where_cond, args = _period_sql(period)
-
-        total = conn.execute(
-            f"""
-            SELECT COUNT(o.id)
-            FROM otps o
-            INNER JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
-            WHERE n.owner_chat_id = ? AND {where_cond}
-            """,
-            [chat_id] + args,
-        ).fetchone()[0]
-
-        by_service = conn.execute(
-            f"""
-            SELECT o.service, COUNT(o.id)
-            FROM otps o
-            INNER JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
-            WHERE n.owner_chat_id = ? AND {where_cond}
-            GROUP BY o.service
-            ORDER BY COUNT(o.id) DESC
-            """,
-            [chat_id] + args,
-        ).fetchall()
-
-        return {"total": total, "by_service": by_service}
-
-    def get_unusable_numbers(self, chat_id: int) -> list:
-        """Return assigned numbers for chat_id that have NEVER received an OTP."""
+    def otp_summary(self, period="all") -> list:
+        cond, args = _period_sql(period)
         conn = self._connect()
         rows = conn.execute(
-            """
-            SELECT n.number
-            FROM numbers n
-            WHERE n.owner_chat_id = ?
-              AND n.status = 'assigned'
+            f"""
+            SELECT COALESCE(n.owner_name, '—'), n.owner_chat_id,
+                   COUNT(DISTINCT o.number) AS num_numbers,
+                   COUNT(*) AS total_otps
+            FROM otps o
+            LEFT JOIN numbers n ON ltrim(o.number, '+') = ltrim(n.number, '+')
+            WHERE {cond}
+            GROUP BY n.owner_chat_id, n.owner_name
+            ORDER BY total_otps DESC
+            """,
+            args,
+        ).fetchall()
+        return [tuple(r) for r in rows]
+
+    def numbers_with_otp(self, period="all") -> list:
+        cond, args = _period_sql(period)
+        conn = self._connect()
+        rows = conn.execute(
+            f"SELECT DISTINCT number FROM otps WHERE {cond}", args
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def numbers_without_otp(self, period="all") -> list:
+        cond, args = _period_sql(period)
+        conn = self._connect()
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT n.number FROM numbers n
+            WHERE n.status = 'assigned'
               AND NOT EXISTS (
                   SELECT 1 FROM otps o
-                  WHERE ltrim(o.number, '+') = ltrim(n.number, '+')
+                  WHERE ltrim(o.number, '+') = ltrim(n.number, '+') AND {cond}
               )
-            ORDER BY n.assigned_at DESC
             """,
-            (chat_id,),
+            args,
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -557,9 +396,7 @@ class Database:
         return today_count, total_count, history
 
     def get_user_otp_history(self, chat_id: int, limit: int = 20) -> list:
-        """Return the last `limit` OTPs received for numbers owned by chat_id.
-        Returns list of (number, service, otp, created_at).
-        """
+        """Return the last `limit` OTPs received for numbers owned by chat_id."""
         conn = self._connect()
         rows = conn.execute(
             """
@@ -575,9 +412,7 @@ class Database:
         return [tuple(r) for r in rows]
 
     def get_user_numbers(self, chat_id: int) -> list:
-        """Return all numbers currently assigned to chat_id.
-        Returns list of (number, service, country, assigned_at).
-        """
+        """Return all numbers currently assigned to chat_id."""
         conn = self._connect()
         rows = conn.execute(
             """
