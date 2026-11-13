@@ -213,6 +213,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Admin Actions (Only for Admin) ──────────────────────────────────────
     if is_admin(user_id):
+        if "Checker System" in text:
+            checkers = db.get_all_checkers()
+            active_chk = db.get_active_checker()
+            active_info = f"🟢 <b>Active:</b> {active_chk['name']} (<code>{active_chk['username']}</code>)" if active_chk else "🔴 <i>No active checker configured.</i>"
+            await update.message.reply_text(
+                "⚙️ <b>Checker System Management</b>\n\n"
+                f"{active_info}\n"
+                f"Default URL: <code>http://api.agbots.site:8080/check/</code>\n\n"
+                "You can add new Telegram checkers or enable/disable existing ones below:",
+                parse_mode="HTML",
+                reply_markup=ui.get_admin_checkers_keyboard(checkers)
+            )
+            return
+
         if "Checker" in text:
             new_val = not checker_enabled
             context.bot_data['checker_enabled'] = new_val
@@ -392,6 +406,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(
                     f"⚠️ Failed to add panel. A panel with name <b>{panel_name}</b> might already exist.",
+                    parse_mode="HTML"
+                )
+            return
+
+        # ── Checker Step 1: Username (auth) Input ──
+        if context.user_data.get('awaiting_checker_username'):
+            if text == "/cancel":
+                context.user_data['awaiting_checker_username'] = False
+                await update.message.reply_text("❌ Cancelled adding checker.")
+                return
+            context.user_data['awaiting_checker_username'] = False
+            username = text.strip()
+            context.user_data['temp_checker_username'] = username
+            context.user_data['awaiting_checker_key'] = True
+            await update.message.reply_text(
+                f"✅ Username: <code>{username}</code>\n\n"
+                f"🔑 Now send your Checker <b>API Key</b> (Step 2/2):\n\n"
+                f"Or send /cancel to abort:",
+                parse_mode="HTML"
+            )
+            return
+
+        # ── Checker Step 2: API Key Input ──
+        if context.user_data.get('awaiting_checker_key'):
+            if text == "/cancel":
+                context.user_data['awaiting_checker_key'] = False
+                context.user_data.pop('temp_checker_username', None)
+                await update.message.reply_text("❌ Cancelled adding checker.")
+                return
+            context.user_data['awaiting_checker_key'] = False
+            api_key = text.strip()
+            username = context.user_data.pop('temp_checker_username', '')
+            checker_name = f"Agbots ({username})"
+            default_url = "http://api.agbots.site:8080/check/"
+
+            # Save in database
+            saved = db.add_checker(checker_name, username, api_key, url=default_url)
+            if saved:
+                # Also ensure checker_enabled is ON
+                context.bot_data['checker_enabled'] = True
+                db.set_setting('checker_enabled', 'true')
+                await update.message.reply_text(
+                    f"🎉 <b>Checker Added & Activated Successfully!</b>\n\n"
+                    f"👤 Username: <code>{username}</code>\n"
+                    f"🔑 API Key: <code>{api_key[:4]}...{api_key[-4:] if len(api_key) > 8 else ''}</code>\n"
+                    f"🔗 URL: <code>{default_url}</code>\n"
+                    f"🟢 Status: <b>Active (ON)</b>",
+                    parse_mode="HTML",
+                    reply_markup=ui.get_admin_reply_keyboard(checker_enabled=True)
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ Failed to add checker. Please try again.",
                     parse_mode="HTML"
                 )
             return
@@ -1033,6 +1100,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Active panels are shown with 🟢, Stopped panels with 🔴.",
             parse_mode="HTML",
             reply_markup=ui.get_admin_panels_keyboard(panels)
+        )
+
+    # ── Custom Checkers Callback Handlers ──
+    elif data == "checker_add_start":
+        if not is_admin(user_id):
+            return
+        context.user_data['awaiting_checker_username'] = True
+        await query.message.reply_text(
+            "⚙️ <b>Add New Checker (Step 1/2)</b>\n\n"
+            "👤 Please send your Checker <b>Username (auth)</b>:\n"
+            "URL: <code>http://api.agbots.site:8080/check/</code>\n\n"
+            "Or send /cancel to abort.",
+            parse_mode="HTML"
+        )
+
+    elif data.startswith("checker_toggle_"):
+        if not is_admin(user_id):
+            return
+        c_id = int(data.replace("checker_toggle_", ""))
+        db.toggle_checker_status(c_id)
+        checkers = db.get_all_checkers()
+        active_chk = db.get_active_checker()
+        active_info = f"🟢 <b>Active:</b> {active_chk['name']} (<code>{active_chk['username']}</code>)" if active_chk else "🔴 <i>No active checker configured.</i>"
+        await query.edit_message_text(
+            "⚙️ <b>Checker System Management</b>\n\n"
+            f"{active_info}\n"
+            f"Default URL: <code>http://api.agbots.site:8080/check/</code>\n\n"
+            "Checker status updated below:",
+            parse_mode="HTML",
+            reply_markup=ui.get_admin_checkers_keyboard(checkers)
+        )
+
+    elif data.startswith("checker_delete_"):
+        if not is_admin(user_id):
+            return
+        c_id = int(data.replace("checker_delete_", ""))
+        db.delete_checker(c_id)
+        checkers = db.get_all_checkers()
+        active_chk = db.get_active_checker()
+        active_info = f"🟢 <b>Active:</b> {active_chk['name']} (<code>{active_chk['username']}</code>)" if active_chk else "🔴 <i>No active checker configured.</i>"
+        await query.edit_message_text(
+            "⚙️ <b>Checker System Management</b>\n\n"
+            f"{active_info}\n"
+            "🗑 Checker deleted successfully:\n\n"
+            f"Default URL: <code>http://api.agbots.site:8080/check/</code>",
+            parse_mode="HTML",
+            reply_markup=ui.get_admin_checkers_keyboard(checkers)
         )
 
     elif data == "report_summary":

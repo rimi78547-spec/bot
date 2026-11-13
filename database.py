@@ -100,6 +100,19 @@ class Database:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                url TEXT NOT NULL DEFAULT 'http://api.agbots.site:8080/check/',
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
 
     # ── processed messages (monitor) ──────────────────────────────────────────
@@ -513,6 +526,79 @@ class Database:
         cur = conn.execute("DELETE FROM panels WHERE id = ?", (panel_id,))
         conn.commit()
         return cur.rowcount > 0
+
+    # ── Dynamic Checker Management ───────────────────────────────────────────
+
+    def get_all_checkers(self) -> list:
+        """Return all checkers: [{id, name, username, api_key, url, is_active, created_at}]"""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT id, name, username, api_key, url, is_active, created_at FROM checkers ORDER BY id ASC"
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "name": r[1],
+                "username": r[2],
+                "api_key": r[3],
+                "url": r[4],
+                "is_active": bool(r[5]),
+                "created_at": r[6]
+            }
+            for r in rows
+        ]
+
+    def add_checker(self, name: str, username: str, api_key: str, url: str = "http://api.agbots.site:8080/check/") -> bool:
+        """Add a new checker into the database."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO checkers (name, username, api_key, url, is_active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (name.strip(), username.strip(), api_key.strip(), (url or "http://api.agbots.site:8080/check/").strip())
+            )
+            conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def toggle_checker_status(self, checker_id: int) -> bool | None:
+        """Toggle checker active/inactive status."""
+        conn = self._connect()
+        row = conn.execute("SELECT is_active FROM checkers WHERE id = ?", (checker_id,)).fetchone()
+        if not row:
+            return None
+        new_status = 0 if row[0] else 1
+        conn.execute("UPDATE checkers SET is_active = ? WHERE id = ?", (new_status, checker_id))
+        conn.commit()
+        return bool(new_status)
+
+    def delete_checker(self, checker_id: int) -> bool:
+        """Delete a checker by ID."""
+        conn = self._connect()
+        cur = conn.execute("DELETE FROM checkers WHERE id = ?", (checker_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+    def get_active_checker(self) -> dict | None:
+        """Return the first active checker config or None."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT id, name, username, api_key, url, is_active, created_at FROM checkers WHERE is_active = 1 ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if row:
+            return {
+                "id": row[0],
+                "name": row[1],
+                "username": row[2],
+                "api_key": row[3],
+                "url": row[4],
+                "is_active": bool(row[5]),
+                "created_at": row[6]
+            }
+        return None
 
 
 db = Database()

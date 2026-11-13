@@ -176,7 +176,7 @@ def get_main_menu_keyboard():
 
 def get_admin_reply_keyboard(checker_enabled=False):
     """Bottom reply keyboard shown in Admin Mode with color styles."""
-    checker_btn_text = "🟢 Checker: ON" if checker_enabled else "🔴 Checker: OFF"
+    checker_toggle_text = "🟢 Checker: ON" if checker_enabled else "🔴 Checker: OFF"
     checker_style = "success" if checker_enabled else "danger"
     keyboard = [
         [
@@ -188,15 +188,18 @@ def get_admin_reply_keyboard(checker_enabled=False):
             KeyboardButton("📊 Reports", style="primary")
         ],
         [
+            KeyboardButton("⚙️ Checker System", style="primary"),
+            KeyboardButton(checker_toggle_text, style=checker_style)
+        ],
+        [
             KeyboardButton("➕ Add Service", style="success"),
             KeyboardButton("🗑 Remove Service", style="danger")
         ],
         [
             KeyboardButton("🗑 Remove Numbers", style="danger"),
-            KeyboardButton(checker_btn_text, style=checker_style)
+            KeyboardButton("🗑 Reset DB", style="danger")
         ],
         [
-            KeyboardButton("🗑 Reset DB", style="danger"),
             KeyboardButton("👤 User Mode", style="danger")
         ]
     ]
@@ -267,12 +270,34 @@ def get_country_selection_keyboard(service, active_countries=None):
     return InlineKeyboardMarkup(keyboard)
 
 def _status_icon(status):
-    """Map a checker status to a color dot: green (registered/valid), red (not registered),
-    yellow (unknown/error)."""
-    if status in (True, 1, "1", "true", "yes"):
+    """Map a checker status to its exact visual icon:
+    🟢 Fresh / Unoccupied (PHONE_NUMBER_UNOCCUPIED, False, 'unoccupied', 'fresh')
+    🔒 Used / Occupied (PHONE_NUMBER_OCCUPIED, True, 'occupied') -> 🔒 lock icon
+    🔴 Ban / Banned / Invalid (PHONE_NUMBER_BANNED, 'banned', 'invalid') -> 🔴 red dot
+    ❄️ Frozen / Suspended ('frozen', 'freeze', 'cold') -> ❄️ snowflake icon
+    🟡 Unknown / Error / Timeout
+    """
+    if status is None:
+        return "🟡"
+
+    s = str(status).strip().upper()
+    
+    # 1. Fresh / Unregistered on Telegram (Available)
+    if s in ("PHONE_NUMBER_UNOCCUPIED", "UNOCCUPIED", "FRESH", "FALSE", "0", "NO"):
         return "🟢"
-    if status in (False, 0, "0", "false", "no"):
+        
+    # 2. Used / Occupied (Already has Telegram account)
+    if s in ("PHONE_NUMBER_OCCUPIED", "OCCUPIED", "TRUE", "1", "YES", "USED"):
+        return "🔒"
+        
+    # 3. Frozen
+    if "FROZEN" in s or "FREEZE" in s or "SUSPEND" in s:
+        return "❄️"
+
+    # 4. Banned / Invalid
+    if "BAN" in s or "INVALID" in s or "BLOCK" in s:
         return "🔴"
+
     return "🟡"
 
 def build_available_numbers_rich_blocks(service_name, numbers=None, mode="RANDOM", prefix=None):
@@ -481,7 +506,15 @@ def format_available_numbers_message(service_name, mode="RANDOM", prefix=None):
     return msg
 
 def get_available_numbers_keyboard(numbers=None, country=None, statuses=None):
-    """Fallback inline keyboard under the available numbers list."""
+    """Fallback inline keyboard under the available numbers list matching Image:
+    - Number buttons are primary (cyan/blue)
+    - If statuses are present, a 🟢 (fresh) or 🔴 (occupied) dot emoji is displayed at the end
+    - Number format has '+' (e.g. +213553686912)
+    - Copy All button is primary
+    - Next Numbers & Random Number are success (green)
+    - Change Service & Set Prefix are danger (red/orange)
+    - OTP Group is primary
+    """
     keyboard = []
     
     # 1. Number buttons with copy feature
@@ -491,15 +524,16 @@ def get_available_numbers_keyboard(numbers=None, country=None, statuses=None):
             num_str = str(num).strip()
             formatted_num = num_str if num_str.startswith("+") else f"+{num_str}"
             formatted_nums.append(formatted_num)
-            norm_key = num_str.lstrip("+")
+            clean_num = num_str.lstrip("+")
             
             flag = get_country_flag(country, num_str)
             
-            if statuses and norm_key in statuses:
-                status_icon = f" {_status_icon(statuses.get(norm_key))}"
+            if statuses and clean_num in statuses:
+                stat = statuses.get(clean_num)
+                status_icon = f" {_status_icon(stat)}"
             else:
                 status_icon = ""
-                
+            
             btn_text = f"{flag} {formatted_num}{status_icon}"
             keyboard.append([
                 InlineKeyboardButton(
@@ -1363,6 +1397,32 @@ def get_admin_panels_keyboard(panels: list):
             InlineKeyboardButton("🗑 Delete", callback_data=f"panel_delete_{p_id}", style="danger")
         ])
         
+    keyboard.append([
+        InlineKeyboardButton("❌ Close", callback_data="admin_cancel", style="danger")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_checkers_keyboard(checkers: list):
+    """Inline keyboard for managing checkers: list checkers with status toggles, add checker, close."""
+    keyboard = []
+    # Button to Add Checker
+    keyboard.append([
+        InlineKeyboardButton("➕ Add Checker", callback_data="checker_add_start", style="success")
+    ])
+
+    for c in checkers:
+        c_id = c["id"]
+        name = c["name"]
+        username = c["username"]
+        status_icon = "🟢" if c["is_active"] else "🔴"
+        action_text = "Disable" if c["is_active"] else "Enable"
+        action_style = "danger" if c["is_active"] else "success"
+
+        keyboard.append([
+            InlineKeyboardButton(f"{status_icon} {name} ({username})", callback_data=f"checker_toggle_{c_id}", style=action_style),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"checker_delete_{c_id}", style="danger")
+        ])
+
     keyboard.append([
         InlineKeyboardButton("❌ Close", callback_data="admin_cancel", style="danger")
     ])
