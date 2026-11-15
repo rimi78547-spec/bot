@@ -299,12 +299,26 @@ class Database:
         return [tuple(r) for r in rows]
 
     def reset_db(self):
-        """Drop all data tables and recreate them (full reset)."""
-        conn = self._connect()
-        conn.execute("DELETE FROM numbers")
-        conn.execute("DELETE FROM otps")
-        conn.execute("DELETE FROM processed_messages")
-        conn.commit()
+        """Full database reset: deletes all numbers, OTPs, processed messages and clears sent caches."""
+        import glob
+        with self._write_lock:
+            conn = self._connect()
+            conn.execute("DELETE FROM numbers")
+            conn.execute("DELETE FROM otps")
+            conn.execute("DELETE FROM processed_messages")
+            conn.commit()
+            try:
+                conn.execute("VACUUM")
+            except Exception:
+                pass
+            
+            # Clear panel sent json files so duplicate hash blockers reset
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            for sent_file in glob.glob(os.path.join(base_dir, "panel_*_sent.json")):
+                try:
+                    os.remove(sent_file)
+                except Exception:
+                    pass
 
     # ── otps ──────────────────────────────────────────────────────────────────
 

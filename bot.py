@@ -980,12 +980,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_reset_confirm":
         if not is_admin(user_id):
             return
-        db.reset_db()
+        await _run_db(db.reset_db)
         context.bot_data['stock'] = {}
         context.bot_data['number_owner'] = {}
+        # Also clear in-memory sent caches of active custom monitors
+        custom_monitors = context.bot_data.get('custom_monitors', {})
+        for mon in custom_monitors.values():
+            if hasattr(mon, 'sent_messages'):
+                mon.sent_messages.clear()
         await query.edit_message_text(
             "✅ <b>Database has been reset!</b>\n\n"
-            "All numbers, OTPs, and processed messages have been deleted.",
+            "All numbers, OTPs, processed messages, and monitor caches have been deleted.",
             parse_mode="HTML"
         )
 
